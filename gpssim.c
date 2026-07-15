@@ -5,12 +5,15 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <pthread.h>
+#include <signal.h>
 #ifdef _WIN32
 #include "getopt.h"
 #else
 #include <unistd.h>
 #endif
 #include "gpssim.h"
+#include "hackrf.h"
 
 int sinTable512[] = {
 	   2,   5,   8,  11,  14,  17,  20,  23,  26,  29,  32,  35,  38,  41,  44,  47,
@@ -93,6 +96,82 @@ double ant_pat_db[37] = {
 int allocatedSat[MAX_SAT];
 
 double xyz[USER_MOTION_SIZE][3];
+
+volatile sig_atomic_t is_running = 1; // 執行標記
+signed char ring_buffer[RB_SIZE];
+size_t rb_head = 0;
+size_t rb_tail = 0;
+size_t rb_count = 0;
+
+pthread_mutex_t rb_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t rb_cond = PTHREAD_COND_INITIALIZER;
+
+// Thread-safe write for the main generation loop
+void rb_write(int8_t* data, size_t len) {
+	pthread_mutex_lock(&rb_mutex);
+
+	while (RB_SIZE - rb_count < len && is_running) {
+		pthread_cond_wait(&rb_cond, &rb_mutex);
+	}
+
+	if (!is_running) {
+		pthread_mutex_unlock(&rb_mutex);
+		return;
+	}
+
+	size_t part1 = RB_SIZE - rb_head;
+	if (len <= part1) {
+		memcpy(ring_buffer + rb_head, data, len);
+	}
+	else {
+		memcpy(ring_buffer + rb_head, data, part1);
+		memcpy(ring_buffer, data + part1, len - part1);
+	}
+
+	rb_head = (rb_head + len) % RB_SIZE;
+	rb_count += len;
+
+	pthread_cond_signal(&rb_cond);
+	pthread_mutex_unlock(&rb_mutex);
+}
+
+// HackRF asynchronous callback
+int hackrf_tx_callback(hackrf_transfer* transfer) {
+	pthread_mutex_lock(&rb_mutex);
+	size_t len = transfer->valid_length;
+
+	if (rb_count >= len) {
+		// Buffer has enough data
+		size_t part1 = RB_SIZE - rb_tail;
+		if (len <= part1) {
+			memcpy(transfer->buffer, ring_buffer + rb_tail, len);
+		}
+		else {
+			memcpy(transfer->buffer, ring_buffer + rb_tail, part1);
+			memcpy(transfer->buffer + part1, ring_buffer, len - part1);
+		}
+		rb_tail = (rb_tail + len) % RB_SIZE;
+		rb_count -= len;
+	}
+	else {
+		// Buffer underrun: zero-fill to avoid transmitting garbage
+		memset(transfer->buffer, 0, len);
+	}
+
+	pthread_cond_signal(&rb_cond); // Wake up the generator loop
+	pthread_mutex_unlock(&rb_mutex);
+
+	return 0; // 0 indicates success to libhackrf
+}
+
+void sigint_handler(int signum) {
+	fprintf(stderr, "\nCaught Ctrl+C, shutting down gracefully...\n");
+	is_running = 0;
+
+	pthread_mutex_lock(&rb_mutex);
+	pthread_cond_broadcast(&rb_cond);
+	pthread_mutex_unlock(&rb_mutex);
+}
 
 /*! \brief Subtract two vectors of double
  *  \param[out] y Result of subtraction
@@ -1793,6 +1872,8 @@ int main(int argc, char *argv[])
 	ionoutc_t ionoutc;
 	int path_loss_enable = TRUE;
 
+	signal(SIGINT, sigint_handler);
+
 	////////////////////////////////////////////////////////////
 	// Read options
 	////////////////////////////////////////////////////////////
@@ -1898,6 +1979,7 @@ int main(int argc, char *argv[])
 				struct tm *gmt;
 
 				time(&timer);
+				timer += 18;
 				gmt = gmtime(&timer);
 
 				t0.y = gmt->tm_year+1900;
@@ -2253,6 +2335,32 @@ int main(int argc, char *argv[])
 	for (i=0; i<37; i++)
 		ant_pat[i] = pow(10.0, -ant_pat_db[i]/20.0);
 
+
+	////////////////////////////////////////////////////////////
+	// Initialize HackRF
+	////////////////////////////////////////////////////////////
+	hackrf_device* device;
+	if (hackrf_init() != HACKRF_SUCCESS) {
+		fprintf(stderr, "ERROR: Failed to initialize HackRF.\n");
+		exit(1);
+	}
+	if (hackrf_open(&device) != HACKRF_SUCCESS) {
+		fprintf(stderr, "ERROR: Failed to open HackRF device.\n");
+		exit(1);
+	}
+
+	hackrf_set_sample_rate(device, samp_freq);
+	hackrf_set_freq(device, 1575420000ull); // L1 frequency
+	hackrf_set_amp_enable(device, 0);       // Enable TX amp
+	hackrf_set_txvga_gain(device, 0);      // TX VGA Gain (adjust 0-47 as needed)
+
+	if (hackrf_start_tx(device, hackrf_tx_callback, NULL) != HACKRF_SUCCESS) {
+		fprintf(stderr, "ERROR: Failed to start HackRF TX.\n");
+		exit(1);
+	}
+
+	fprintf(stderr, "HackRF TX Started at 1575.42 MHz...\n");
+
 	////////////////////////////////////////////////////////////
 	// Generate baseband signals
 	////////////////////////////////////////////////////////////
@@ -2262,7 +2370,7 @@ int main(int argc, char *argv[])
 	// Update receiver time
 	grx = incGpsTime(grx, 0.1);
 
-	for (iumd=1; iumd<numd; iumd++)
+	for (iumd = 1; iumd < numd && is_running; iumd++)
 	{
 		for (i=0; i<MAX_CHAN; i++)
 		{
@@ -2397,7 +2505,9 @@ int main(int argc, char *argv[])
 				//iq8_buff[isamp] = iq_buff[isamp] >> 8; // for PocketSDR
 			}
 
-			fwrite(iq8_buff, 1, 2*iq_buff_size, fp);
+			//fwrite(iq8_buff, 1, 2*iq_buff_size, fp);
+			// Write to ring buffer instead of file
+			rb_write(iq8_buff, 2 * iq_buff_size);
 		}
 		else // data_format==SC16
 		{
@@ -2472,6 +2582,11 @@ int main(int argc, char *argv[])
 	tend = clock();
 
 	fprintf(stderr, "\nDone!\n");
+
+	// HackRF Cleanup
+	hackrf_stop_tx(device);
+	hackrf_close(device);
+	hackrf_exit();
 
 	// Free I/Q buffer
 	free(iq_buff);
