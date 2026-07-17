@@ -1979,7 +1979,6 @@ int main(int argc, char *argv[])
 				struct tm *gmt;
 
 				time(&timer);
-				timer += 18;
 				gmt = gmtime(&timer);
 
 				t0.y = gmt->tm_year+1900;
@@ -2351,7 +2350,7 @@ int main(int argc, char *argv[])
 
 	hackrf_set_sample_rate(device, samp_freq);
 	hackrf_set_freq(device, 1575420000ull); // L1 frequency
-	hackrf_set_amp_enable(device, 0);       // Enable TX amp
+	hackrf_set_amp_enable(device, 1);       // Enable TX amp
 	hackrf_set_txvga_gain(device, 0);      // TX VGA Gain (adjust 0-47 as needed)
 
 	if (hackrf_start_tx(device, hackrf_tx_callback, NULL) != HACKRF_SUCCESS) {
@@ -2582,6 +2581,7 @@ int main(int argc, char *argv[])
 	tend = clock();
 
 	fprintf(stderr, "\nDone!\n");
+	while (rb_count);
 
 	// HackRF Cleanup
 	hackrf_stop_tx(device);

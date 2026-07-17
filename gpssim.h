@@ -80,7 +80,7 @@
 
 #define EPHEM_ARRAY_SIZE (15) // for daily GPS broadcast ephemers file (brdc)
 
-#define RB_SIZE 268435456 // 256MB Ring Buffer
+#define RB_SIZE 104857600 // 100MB Ring Buffer
 
 /*! \brief Structure representing GPS time */
 typedef struct
