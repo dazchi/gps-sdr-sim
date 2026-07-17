@@ -89,6 +89,7 @@ Options:
   -i               Disable ionospheric delay for spacecraft scenario
   -p [fixed_gain]  Disable path loss and hold power level constant
   -v               Show details about simulated channels
+  -H               Transmit directly via HackRF (must use with -b 8, bypasses output file)
 ```
 
 The user motion can be specified in either dynamic or static mode:
@@ -137,13 +138,20 @@ You can also execute these commands via the `bladeRF-cli` script option as below
 
 #### HackRF:
 
-The output data have to be 8-bit signed I/Q samples.
-```
-> gps-sdr-sim -e brdc0010.22n -b 8
-```
-You can use `hackrf_transfer` tool in the HackRF host software. 
+**Option 1 — Direct transmit (no intermediate file):**
+
+Use the `-H` flag to stream I/Q samples directly to a connected HackRF device in real time via a ring buffer. This requires 8-bit signed I/Q format (`-b 8`).
 
 ```
+> gps-sdr-sim -e brdc0010.22n -b 8 -H
+```
+
+**Option 2 — File-based transmit:**
+
+Generate a file first, then play it back with `hackrf_transfer`:
+
+```
+> gps-sdr-sim -e brdc0010.22n -b 8
 > hackrf_transfer -t gpssim.bin -f 1575420000 -s 2600000 -a 1 -x 0
 ```
 

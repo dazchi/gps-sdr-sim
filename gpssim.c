@@ -1485,6 +1485,7 @@ int readUserMotionLLH(double xyz[USER_MOTION_SIZE][3], const char *filename)
 {
 	FILE *fp;
 	int numd;
+	int result;
 	double t,llh[3];
 	char str[MAX_CHAR];
 
@@ -1496,8 +1497,15 @@ int readUserMotionLLH(double xyz[USER_MOTION_SIZE][3], const char *filename)
 		if (fgets(str, MAX_CHAR, fp)==NULL)
 			break;
 
-		if (EOF==sscanf(str, "%lf,%lf,%lf,%lf", &t, &llh[0], &llh[1], &llh[2])) // Read CSV line
+		result = sscanf(str, "%lf,%lf,%lf,%lf", &t, &llh[0], &llh[1], &llh[2]); // Read CSV line
+		if (result == EOF)
 			break;
+
+		if (result == 0)
+		{
+			numd--;
+			continue;
+		}
 
 		if (llh[0] > 90.0 || llh[0] < -90.0 || llh[1]>180.0 || llh[1] < -180.0)
 		{
@@ -1801,7 +1809,8 @@ void usage(void)
 		"  -b <iq_bits>     I/Q data format [1/8/16] (default: 16)\n"
 		"  -i               Disable ionospheric delay for spacecraft scenario\n"
 		"  -p [fixed_gain]  Disable path loss and hold power level constant\n"
-		"  -v               Show details about simulated channels\n",
+		"  -v               Show details about simulated channels\n"
+		"  -H               Transmit directly via HackRF (must use with -b 8, bypasses output file)\n",
 		((double)USER_MOTION_SIZE) / 10.0, STATIC_MAX_DURATION);
 
 	return;
@@ -1811,7 +1820,7 @@ int main(int argc, char *argv[])
 {
 	clock_t tstart,tend;
 
-	FILE *fp;
+	FILE *fp = NULL;
 
 	int sv;
 	int neph,ieph;
@@ -1897,7 +1906,9 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	while ((result=getopt(argc,argv,"e:u:x:g:c:l:o:s:b:L:T:t:d:ipv"))!=-1)
+	int hackrf_mode = FALSE;
+
+	while ((result=getopt(argc,argv,"e:u:x:g:c:l:o:s:b:L:T:t:d:ipvH"))!=-1)
 	{
 		switch (result)
 		{
@@ -2025,6 +2036,9 @@ int main(int argc, char *argv[])
 		case 'v':
 			verb = TRUE;
 			break;
+		case 'H':
+			hackrf_mode = TRUE;
+			break;
 		case ':':
 		case '?':
 			usage();
@@ -2037,6 +2051,12 @@ int main(int argc, char *argv[])
 	if (navfile[0]==0)
 	{
 		fprintf(stderr, "ERROR: GPS ephemeris file is not specified.\n");
+		exit(1);
+	}
+
+	if (hackrf_mode && data_format != SC08)
+	{
+		fprintf(stderr, "ERROR: HackRF mode requires 8-bit I/Q format. Use -b 8.\n");
 		exit(1);
 	}
 
@@ -2292,14 +2312,16 @@ int main(int argc, char *argv[])
 
 	// Open output file
 	// "-" can be used as name for stdout
-	if(strcmp("-", outfile)){
-		if (NULL==(fp=fopen(outfile,"wb")))
-		{
-			fprintf(stderr, "ERROR: Failed to open output file.\n");
-			exit(1);
+	if (!hackrf_mode) {
+		if(strcmp("-", outfile)){
+			if (NULL==(fp=fopen(outfile,"wb")))
+			{
+				fprintf(stderr, "ERROR: Failed to open output file.\n");
+				exit(1);
+			}
+		}else{
+			fp = stdout;
 		}
-	}else{
-		fp = stdout;
 	}
 
 	////////////////////////////////////////////////////////////
@@ -2336,29 +2358,31 @@ int main(int argc, char *argv[])
 
 
 	////////////////////////////////////////////////////////////
-	// Initialize HackRF
+	// Initialize HackRF (only in HackRF mode)
 	////////////////////////////////////////////////////////////
-	hackrf_device* device;
-	if (hackrf_init() != HACKRF_SUCCESS) {
-		fprintf(stderr, "ERROR: Failed to initialize HackRF.\n");
-		exit(1);
-	}
-	if (hackrf_open(&device) != HACKRF_SUCCESS) {
-		fprintf(stderr, "ERROR: Failed to open HackRF device.\n");
-		exit(1);
-	}
+	hackrf_device* device = NULL;
+	if (hackrf_mode) {
+		if (hackrf_init() != HACKRF_SUCCESS) {
+			fprintf(stderr, "ERROR: Failed to initialize HackRF.\n");
+			exit(1);
+		}
+		if (hackrf_open(&device) != HACKRF_SUCCESS) {
+			fprintf(stderr, "ERROR: Failed to open HackRF device.\n");
+			exit(1);
+		}
 
-	hackrf_set_sample_rate(device, samp_freq);
-	hackrf_set_freq(device, 1575420000ull); // L1 frequency
-	hackrf_set_amp_enable(device, 1);       // Enable TX amp
-	hackrf_set_txvga_gain(device, 0);      // TX VGA Gain (adjust 0-47 as needed)
+		hackrf_set_sample_rate(device, samp_freq);
+		hackrf_set_freq(device, 1575420000ull); // L1 frequency
+		hackrf_set_amp_enable(device, 1);       // Enable TX amp
+		hackrf_set_txvga_gain(device, 0);       // TX VGA Gain (adjust 0-47 as needed)
 
-	if (hackrf_start_tx(device, hackrf_tx_callback, NULL) != HACKRF_SUCCESS) {
-		fprintf(stderr, "ERROR: Failed to start HackRF TX.\n");
-		exit(1);
+		if (hackrf_start_tx(device, hackrf_tx_callback, NULL) != HACKRF_SUCCESS) {
+			fprintf(stderr, "ERROR: Failed to start HackRF TX.\n");
+			exit(1);
+		}
+
+		fprintf(stderr, "HackRF TX Started at 1575.42 MHz...\n");
 	}
-
-	fprintf(stderr, "HackRF TX Started at 1575.42 MHz...\n");
 
 	////////////////////////////////////////////////////////////
 	// Generate baseband signals
@@ -2504,9 +2528,10 @@ int main(int argc, char *argv[])
 				//iq8_buff[isamp] = iq_buff[isamp] >> 8; // for PocketSDR
 			}
 
-			//fwrite(iq8_buff, 1, 2*iq_buff_size, fp);
-			// Write to ring buffer instead of file
-			rb_write(iq8_buff, 2 * iq_buff_size);
+			if (hackrf_mode)
+				rb_write(iq8_buff, 2 * iq_buff_size);
+			else
+				fwrite(iq8_buff, 1, 2*iq_buff_size, fp);
 		}
 		else // data_format==SC16
 		{
@@ -2581,18 +2606,18 @@ int main(int argc, char *argv[])
 	tend = clock();
 
 	fprintf(stderr, "\nDone!\n");
-	while (rb_count);
 
-	// HackRF Cleanup
-	hackrf_stop_tx(device);
-	hackrf_close(device);
-	hackrf_exit();
+	if (hackrf_mode) {
+		while (rb_count); // Drain ring buffer before tearing down HackRF
+		hackrf_stop_tx(device);
+		hackrf_close(device);
+		hackrf_exit();
+	} else {
+		fclose(fp);
+	}
 
 	// Free I/Q buffer
 	free(iq_buff);
-
-	// Close file
-	fclose(fp);
 
 	// Process time
 	fprintf(stderr, "Process time = %.1f [sec]\n", (double)(tend-tstart)/CLOCKS_PER_SEC);
