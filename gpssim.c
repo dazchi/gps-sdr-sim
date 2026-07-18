@@ -15,6 +15,24 @@
 #include "gpssim.h"
 #include "hackrf.h"
 
+// Socket platform compatibility
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+typedef SOCKET sock_t;
+#define SOCK_INVALID INVALID_SOCKET
+#define sock_close   closesocket
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+typedef int sock_t;
+#define SOCK_INVALID (-1)
+#define sock_close   close
+#endif
+
 int sinTable512[] = {
 	   2,   5,   8,  11,  14,  17,  20,  23,  26,  29,  32,  35,  38,  41,  44,  47,
 	  50,  53,  56,  59,  62,  65,  68,  71,  74,  77,  80,  83,  86,  89,  91,  94,
@@ -99,18 +117,31 @@ double xyz[USER_MOTION_SIZE][3];
 
 volatile sig_atomic_t is_running = 1; // 執行標記
 signed char ring_buffer[RB_SIZE];
-size_t rb_head = 0;
-size_t rb_tail = 0;
+size_t rb_head  = 0;
+size_t rb_tail  = 0;
 size_t rb_count = 0;
+size_t rb_hwm   = RB_SIZE; // high-water mark; tightened in socket mode
+
+// Feedback socket: the currently connected frontend client.
+// Set by socket_listener_thread; written by main loop to echo back processed LLH.
+static volatile sock_t feedback_sock = SOCK_INVALID;
+// Last processed position in degrees (lat, lon, height) — updated from FIFO, sent every tick.
+static double current_llh_deg[3] = {0.0, 0.0, 0.0};
 
 pthread_mutex_t rb_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t rb_cond = PTHREAD_COND_INITIALIZER;
+
+// Position FIFO for socket mode (lat_rad, lon_rad, height_m)
+static double pos_fifo[POS_FIFO_SIZE][3];
+static size_t pos_f_head = 0, pos_f_tail = 0, pos_f_count = 0;
+static pthread_mutex_t pos_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  pos_cond  = PTHREAD_COND_INITIALIZER;
 
 // Thread-safe write for the main generation loop
 void rb_write(int8_t* data, size_t len) {
 	pthread_mutex_lock(&rb_mutex);
 
-	while (RB_SIZE - rb_count < len && is_running) {
+	while (rb_hwm - rb_count < len && is_running) {
 		pthread_cond_wait(&rb_cond, &rb_mutex);
 	}
 
@@ -1790,6 +1821,120 @@ int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t 
 	return(nsat);
 }
 
+static double haversine_dist(double lat1, double lon1, double lat2, double lon2)
+{
+	double dlat = lat2 - lat1;
+	double dlon = lon2 - lon1;
+	double a = sin(dlat/2)*sin(dlat/2) + cos(lat1)*cos(lat2)*sin(dlon/2)*sin(dlon/2);
+	return 2.0 * WGS84_RADIUS * atan2(sqrt(a), sqrt(1.0-a));
+}
+
+static void* socket_listener_thread(void* arg)
+{
+	double last_llh[3] = {0, 0, 0};
+	int has_last = 0;
+
+#ifdef _WIN32
+	WSADATA wsa;
+	WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+
+	sock_t srv = socket(AF_INET, SOCK_STREAM, 0);
+	int opt = 1;
+	setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family      = AF_INET;
+	addr.sin_addr.s_addr = INADDR_ANY;
+	addr.sin_port        = htons(SOCKET_PORT);
+
+	if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+		fprintf(stderr, "ERROR: Failed to bind socket on port %d.\n", SOCKET_PORT);
+		sock_close(srv);
+		return NULL;
+	}
+	listen(srv, 1);
+	fprintf(stderr, "Listening for LLH positions on TCP port %d (format: lat,lon,height)...\n", SOCKET_PORT);
+
+	while (is_running) {
+		// Use select with 1-second timeout so we can check is_running on shutdown
+		fd_set rfds;
+		FD_ZERO(&rfds);
+		FD_SET(srv, &rfds);
+		struct timeval tv = {1, 0};
+		if (select((int)srv + 1, &rfds, NULL, NULL, &tv) <= 0)
+			continue;
+
+		sock_t client = accept(srv, NULL, NULL);
+		if (client == SOCK_INVALID) break;
+		int nodelay = 1;
+		setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+		feedback_sock = client;
+		fprintf(stderr, "Socket client connected.\n");
+
+		char buf[256];
+		int buflen = 0;
+
+		while (is_running) {
+			char c;
+			if (recv(client, &c, 1, 0) <= 0) break;
+
+			if (c == '\n') {
+				buf[buflen] = '\0';
+				buflen = 0;
+
+				double lat, lon, hgt;
+				if (sscanf(buf, "%lf,%lf,%lf", &lat, &lon, &hgt) != 3)
+					continue;
+
+				double lat_r = lat / R2D;
+				double lon_r = lon / R2D;
+
+				if (has_last) {
+					double dist = haversine_dist(last_llh[0], last_llh[1], lat_r, lon_r);
+					if (dist > MAX_POS_JUMP_M) {
+						fprintf(stderr, "WARNING: Position jump %.0f m exceeds %.0f m limit, rejected.\n",
+							dist, MAX_POS_JUMP_M);
+						continue;
+					}
+				}
+
+				last_llh[0] = lat_r;
+				last_llh[1] = lon_r;
+				last_llh[2] = hgt;
+				has_last = 1;
+
+				pthread_mutex_lock(&pos_mutex);
+				if (pos_f_count < POS_FIFO_SIZE) {
+					pos_fifo[pos_f_head][0] = lat_r;
+					pos_fifo[pos_f_head][1] = lon_r;
+					pos_fifo[pos_f_head][2] = hgt;
+					pos_f_head = (pos_f_head + 1) % POS_FIFO_SIZE;
+					pos_f_count++;
+					pthread_cond_signal(&pos_cond);
+				} else {
+					fprintf(stderr, "WARNING: Position FIFO full, discarding position.\n");
+				}
+				pthread_mutex_unlock(&pos_mutex);
+
+			} else if (buflen < (int)sizeof(buf) - 1) {
+				buf[buflen++] = c;
+			}
+		}
+
+		feedback_sock = SOCK_INVALID;
+		sock_close(client);
+		fprintf(stderr, "Socket client disconnected.\n");
+	}
+
+	sock_close(srv);
+#ifdef _WIN32
+	WSACleanup();
+#endif
+	return NULL;
+}
+
 void usage(void)
 {
 	fprintf(stderr, "Usage: gps-sdr-sim [options]\n"
@@ -1810,8 +1955,10 @@ void usage(void)
 		"  -i               Disable ionospheric delay for spacecraft scenario\n"
 		"  -p [fixed_gain]  Disable path loss and hold power level constant\n"
 		"  -v               Show details about simulated channels\n"
-		"  -H               Transmit directly via HackRF (must use with -b 8, bypasses output file)\n",
-		((double)USER_MOTION_SIZE) / 10.0, STATIC_MAX_DURATION);
+		"  -H               Transmit directly via HackRF (must use with -b 8, bypasses output file)\n"
+		"  -S               Accept live LLH positions via TCP socket (port %d, requires -H -b 8)\n"
+		"                   Format: lat,lon,height\\n  Consecutive jumps > %.0f m are rejected\n",
+		((double)USER_MOTION_SIZE) / 10.0, STATIC_MAX_DURATION, SOCKET_PORT, MAX_POS_JUMP_M);
 
 	return;
 }
@@ -1907,8 +2054,9 @@ int main(int argc, char *argv[])
 	}
 
 	int hackrf_mode = FALSE;
+	int socket_mode = FALSE;
 
-	while ((result=getopt(argc,argv,"e:u:x:g:c:l:o:s:b:L:T:t:d:ipvH"))!=-1)
+	while ((result=getopt(argc,argv,"e:u:x:g:c:l:o:s:b:L:T:t:d:ipvHS"))!=-1)
 	{
 		switch (result)
 		{
@@ -2039,6 +2187,9 @@ int main(int argc, char *argv[])
 		case 'H':
 			hackrf_mode = TRUE;
 			break;
+		case 'S':
+			socket_mode = TRUE;
+			break;
 		case ':':
 		case '?':
 			usage();
@@ -2058,6 +2209,22 @@ int main(int argc, char *argv[])
 	{
 		fprintf(stderr, "ERROR: HackRF mode requires 8-bit I/Q format. Use -b 8.\n");
 		exit(1);
+	}
+
+	if (socket_mode && !hackrf_mode)
+	{
+		fprintf(stderr, "ERROR: Socket mode (-S) requires HackRF mode (-H -b 8).\n");
+		exit(1);
+	}
+
+	// Socket mode provides positions at runtime; use a placeholder static location
+	// (will be replaced by the first position received before TX begins)
+	if (socket_mode && !staticLocationMode && umfile[0] == 0)
+	{
+		staticLocationMode = TRUE;
+		llh[0] = 35.681298 / R2D;
+		llh[1] = 139.766247 / R2D;
+		llh[2] = 10.0;
 	}
 
 	if (umfile[0]==0 && !staticLocationMode)
@@ -2080,6 +2247,14 @@ int main(int argc, char *argv[])
 	samp_freq = floor(samp_freq/10.0);
 	iq_buff_size = (int)samp_freq; // samples per 0.1sec
 	samp_freq *= 10.0;
+
+	// In socket mode limit ring buffer pre-computation to SOCKET_RB_CHUNKS * 100 ms.
+	// Without this the main loop races ~19 s ahead, draining the position FIFO
+	// instantly and introducing up to 19 s of latency before real-time pacing kicks in.
+	if (socket_mode) {
+		rb_hwm = (size_t)SOCKET_RB_CHUNKS * 2 * (size_t)iq_buff_size;
+		if (rb_hwm > RB_SIZE) rb_hwm = RB_SIZE;
+	}
 
 	delt = 1.0/samp_freq;
 
@@ -2376,6 +2551,39 @@ int main(int argc, char *argv[])
 		hackrf_set_amp_enable(device, 1);       // Enable TX amp
 		hackrf_set_txvga_gain(device, 0);       // TX VGA Gain (adjust 0-47 as needed)
 
+		if (socket_mode) {
+			pthread_t sock_thread;
+			pthread_create(&sock_thread, NULL, socket_listener_thread, NULL);
+			pthread_detach(sock_thread);
+
+			// Block until the first position is received before opening the RF link
+			fprintf(stderr, "Waiting for initial position on TCP port %d...\n", SOCKET_PORT);
+			pthread_mutex_lock(&pos_mutex);
+			while (pos_f_count == 0 && is_running)
+				pthread_cond_wait(&pos_cond, &pos_mutex);
+			if (pos_f_count > 0) {
+				double llh_s[3];
+				llh_s[0] = pos_fifo[pos_f_tail][0];
+				llh_s[1] = pos_fifo[pos_f_tail][1];
+				llh_s[2] = pos_fifo[pos_f_tail][2];
+				pos_f_tail = (pos_f_tail + 1) % POS_FIFO_SIZE;
+				pos_f_count--;
+				llh2xyz(llh_s, xyz[0]);
+				current_llh_deg[0] = llh_s[0] * R2D;
+				current_llh_deg[1] = llh_s[1] * R2D;
+				current_llh_deg[2] = llh_s[2];
+			}
+			pthread_mutex_unlock(&pos_mutex);
+
+			if (!is_running) {
+				hackrf_close(device);
+				hackrf_exit();
+				free(iq_buff);
+				exit(0);
+			}
+			fprintf(stderr, "Initial position received. Starting HackRF TX...\n");
+		}
+
 		if (hackrf_start_tx(device, hackrf_tx_callback, NULL) != HACKRF_SUCCESS) {
 			fprintf(stderr, "ERROR: Failed to start HackRF TX.\n");
 			exit(1);
@@ -2393,8 +2601,37 @@ int main(int argc, char *argv[])
 	// Update receiver time
 	grx = incGpsTime(grx, 0.1);
 
-	for (iumd = 1; iumd < numd && is_running; iumd++)
+	for (iumd = 1; (socket_mode || iumd < numd) && is_running; iumd++)
 	{
+		// In socket mode, consume next position from the FIFO if available;
+		// otherwise keep transmitting from the last known position.
+		if (socket_mode) {
+			pthread_mutex_lock(&pos_mutex);
+			if (pos_f_count > 0) {
+				double llh_s[3];
+				llh_s[0] = pos_fifo[pos_f_tail][0];
+				llh_s[1] = pos_fifo[pos_f_tail][1];
+				llh_s[2] = pos_fifo[pos_f_tail][2];
+				pos_f_tail = (pos_f_tail + 1) % POS_FIFO_SIZE;
+				pos_f_count--;
+				llh2xyz(llh_s, xyz[0]);
+				current_llh_deg[0] = llh_s[0] * R2D;
+				current_llh_deg[1] = llh_s[1] * R2D;
+				current_llh_deg[2] = llh_s[2];
+			}
+			pthread_mutex_unlock(&pos_mutex);
+
+			// Send current processed LLH to frontend every tick (10 Hz)
+			sock_t fb_sock = feedback_sock;
+			if (fb_sock != SOCK_INVALID) {
+				char fb_buf[64];
+				int fb_len = snprintf(fb_buf, sizeof(fb_buf), "%.8f,%.8f,%.2f\n",
+					current_llh_deg[0], current_llh_deg[1], current_llh_deg[2]);
+				if (send(fb_sock, fb_buf, fb_len, 0) < 0)
+					feedback_sock = SOCK_INVALID;
+			}
+		}
+
 		for (i=0; i<MAX_CHAN; i++)
 		{
 			if (chan[i].prn>0)

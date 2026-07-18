@@ -90,6 +90,9 @@ Options:
   -p [fixed_gain]  Disable path loss and hold power level constant
   -v               Show details about simulated channels
   -H               Transmit directly via HackRF (must use with -b 8, bypasses output file)
+  -S               Accept live LLH positions via TCP socket (port 6000, requires -H -b 8)
+                   Format: lat,lon,height\n  Consecutive jumps > 10000 m are rejected
+                   Echoes back each processed position as lat,lon,height\n for UI feedback
 ```
 
 The user motion can be specified in either dynamic or static mode:
@@ -192,6 +195,58 @@ Set RF bandwidth:
 > plutoplayer -t gpssim.bin -b 3.0
 ```
 Default 3.0MHz. Applicable range 1.0MHz to 5.0MHz.
+
+### Live position streaming (`-S`)
+
+The `-S` flag enables real-time GPS position injection over a TCP socket on port **6000**. This is intended for use alongside `-H -b 8` for continuous HackRF transmission.
+
+**Protocol:**
+- Send positions as newline-terminated CSV: `lat,lon,height\n` (decimal degrees, metres)
+- gps-sdr-sim echoes back each processed position in the same format for UI feedback
+- Consecutive position jumps greater than 10 000 m are silently rejected
+
+**Example — static position via netcat:**
+```
+gps-sdr-sim -e live.n -b 8 -H -S
+echo "1.3521,103.8198,30.0" | nc 127.0.0.1 6000
+```
+
+### Live ephemeris capture (`scripts/rtcm_to_rinex.py`)
+
+`scripts/rtcm_to_rinex.py` connects to a public NTRIP caster, captures RTCM 1019 messages for up to 16 GPS satellites, and writes a RINEX 2.11 navigation file (`live.n`) for use with `-T now`:
+
+```
+python scripts/rtcm_to_rinex.py   # requires pyrtcm (pip install pyrtcm)
+gps-sdr-sim -e scripts/live.n -b 8 -H -S -T now
+```
+
+The script targets the `RTCM3EPH` mountpoint by default. Edit the `SERVER`, `PORT`, and `EMAIL` constants at the top of the file to use a different NTRIP caster.
+
+### Web route planner (`frontend/`)
+
+A browser-based route planner that streams GPS positions to a running `gps-sdr-sim -H -b 8 -S` instance.
+
+**Features:**
+- Interactive Leaflet map — click to add waypoints, right-click to teleport the sim position
+- Route planning via [GraphHopper](https://www.graphhopper.com/) (foot / bike / car profiles) or raw waypoint interpolation
+- Walk / Bike / Drive speed presets (5 / 10 / 40 km/h)
+- Speed jitter and random waypoint stops for realistic motion
+- Sim LLH feedback: displays the last position processed by gps-sdr-sim; click to pan the map
+- GPX export of the planned route
+- SRTM elevation lookup via [OpenTopoData](https://www.opentopodata.org/)
+
+**Setup:**
+```
+cd frontend
+npm install
+# Optional: create keys.js with your GraphHopper API key for route planning
+echo "module.exports = { graphhopper: 'YOUR_KEY_HERE' };" > keys.js
+node server.js
+```
+
+Open `http://localhost:3000` in a browser, start `gps-sdr-sim` with `-H -b 8 -S`, then click **Connect to Simulator**.
+
+The Node.js server bridges the browser WebSocket connection to gps-sdr-sim's TCP socket on port 6000 and proxies routing and elevation API requests server-side to avoid CORS restrictions.
 
 ### License
 

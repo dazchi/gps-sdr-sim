@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GPS-SDR-SIM Route Planner</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Sidebar ── -->
+  <aside id="sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-title">GPS Route Planner</div>
+      <div class="sidebar-sub">gps-sdr-sim live position feed</div>
+    </div>
+
+    <!-- API Usage -->
+    <div class="panel" id="panel-credits" style="display:none">
+      <div class="panel-label">GraphHopper Credits</div>
+      <div class="credits-bar-wrap">
+        <div class="credits-bar" id="credits-bar"></div>
+      </div>
+      <div class="credits-text" id="credits-text"></div>
+    </div>
+
+    <!-- Connection -->
+    <div class="panel">
+      <div class="panel-label">Connection</div>
+      <div class="status-row">
+        <span id="status-dot"></span>
+        <span id="status-text">Disconnected</span>
+      </div>
+      <button id="btn-connect" class="btn btn-primary w-full">Connect to Simulator</button>
+      <div class="hint">gps-sdr-sim must be running with&nbsp;<code>-H -b 8 -S</code></div>
+    </div>
+
+    <!-- Playback -->
+    <div class="panel">
+      <div class="panel-label">Playback</div>
+
+      <div class="field-row">
+        <label>Speed</label>
+        <div class="input-unit">
+          <input type="number" id="input-speed" value="5" min="1" max="500">
+          <span>km/h</span>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <label>Altitude <span class="label-hint">(fallback)</span></label>
+        <div class="input-unit">
+          <input type="number" id="input-alt" value="10" min="-500" max="10000">
+          <span>m</span>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <label>Routing</label>
+        <div class="mode-group" id="routing-group">
+          <button class="mode-btn"        data-routing="raw"  >📍 Waypoints</button>
+          <button class="mode-btn active" data-routing="route">🗺 Route</button>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <label>Mode</label>
+        <div class="mode-group" id="mode-group">
+          <button class="mode-btn active" data-profile="foot">🚶 Walk</button>
+          <button class="mode-btn"        data-profile="bike">🚴 Bike</button>
+          <button class="mode-btn"        data-profile="car" >🚗 Drive</button>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <label>Back &amp; forth</label>
+        <input type="checkbox" id="input-loop">
+      </div>
+
+      <div class="play-row">
+        <button id="btn-play"  class="btn btn-success flex-1" disabled>▶ Play</button>
+        <button id="btn-pause" class="btn btn-warning"        disabled>⏸</button>
+        <button id="btn-stop"  class="btn btn-danger"         disabled>⏹</button>
+      </div>
+      <div id="route-status" class="route-status"></div>
+    </div>
+
+    <!-- Dynamics -->
+    <div class="panel">
+      <div class="panel-label">Dynamics</div>
+
+      <div class="field-row">
+        <label>Speed jitter</label>
+        <div class="input-unit">
+          <input type="number" id="input-jitter" value="0.20" min="0" max="0.99" step="0.05">
+          <span>±</span>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <label>Stop prob.</label>
+        <div class="input-unit">
+          <input type="number" id="input-stop-prob" value="0.15" min="0" max="1" step="0.05">
+        </div>
+      </div>
+
+      <div class="field-row">
+        <label>Stop duration</label>
+        <div class="range-group">
+          <input type="number" id="input-stop-min" value="3"  min="0" max="300" step="1">
+          <span>–</span>
+          <input type="number" id="input-stop-max" value="12" min="0" max="300" step="1">
+          <span>s</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Route info -->
+    <div class="panel">
+      <div class="panel-label">Route Info</div>
+      <div class="info-grid">
+        <span class="info-key">Distance</span>   <span id="info-dist">—</span>
+        <span class="info-key">Est. time</span>  <span id="info-time">—</span>
+        <span class="info-key">Progress</span>   <span id="info-prog">—</span>
+        <span class="info-key">Position</span>   <span id="info-pos">—</span>
+        <span class="info-key">Sim LLH</span>    <span id="info-sim-pos" class="info-sim-pos">—</span>
+      </div>
+      <div class="play-row mt-8">
+        <button id="btn-gpx"   class="btn btn-secondary flex-1" disabled>⬇ GPX</button>
+        <button id="btn-clear" class="btn btn-secondary flex-1">Clear Route</button>
+      </div>
+    </div>
+
+    <!-- Waypoint list -->
+    <div class="panel panel-grow">
+      <div class="panel-label">
+        Waypoints
+        <span id="wp-count" class="badge">0</span>
+      </div>
+      <div class="panel-hint">Left-click map to add &nbsp;·&nbsp; Right-click map to set sim position</div>
+      <div id="wp-list"></div>
+    </div>
+  </aside>
+
+  <!-- ── Map ── -->
+  <div id="map-wrap">
+    <div id="map"></div>
+    <div id="map-coords"></div>
+  </div>
+
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

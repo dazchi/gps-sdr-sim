@@ -81,6 +81,11 @@
 #define EPHEM_ARRAY_SIZE (15) // for daily GPS broadcast ephemers file (brdc)
 
 #define RB_SIZE 104857600 // 100MB Ring Buffer
+#define SOCKET_RB_CHUNKS 10       // chunks buffered ahead in socket mode (~1 s latency)
+
+#define SOCKET_PORT    6000   // TCP port for live LLH position input
+#define POS_FIFO_SIZE  256    // Depth of the position FIFO
+#define MAX_POS_JUMP_M 1000.0 // Maximum allowed jump between consecutive positions (metres)
 
 /*! \brief Structure representing GPS time */
 typedef struct
