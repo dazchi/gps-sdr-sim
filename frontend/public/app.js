@@ -4,9 +4,10 @@
 const TICK_MS         = 100;   // 10 Hz — matches gps-sdr-sim update rate
 const EARTH_R         = 6371000;
 const GH_ROUTE_BASE   = '/api/route';   // proxied through server.js (key stays server-side)
+const GH_MAX_PTS      = 5;             // GraphHopper free-tier per-request waypoint limit
 const ELEV_BASE       = '/api/elevation';   // proxied through server.js to avoid CORS
 const MAX_ELEV_PTS    = 100;   // OpenTopoData public limit per request
-const FETCH_DEBOUNCE  = 500;   // ms to wait after last waypoint change before fetching
+const FETCH_DEBOUNCE  = 1000;  // ms to wait after last waypoint change before fetching
 
 // ── State ────────────────────────────────────────────────────
 let ws        = null;
@@ -27,6 +28,7 @@ let ghCredits       = null;   // { limit, remaining, resetTs }
 let fetchTimer      = null;
 let fetchController = null;
 let fetchingRoute   = false;
+let retryTimer      = null;  // interval ID for GH rate-limit countdown
 
 let playing   = false;
 let paused    = false;
@@ -154,8 +156,39 @@ function interpolateAlt(frac) {
 
 // ── OSRM routing ─────────────────────────────────────────────
 function scheduleRouteFetch() {
+    // Cancel any active rate-limit countdown before starting a new fetch cycle
+    clearInterval(retryTimer);
+    retryTimer = null;
+    // Abort any in-flight GH request immediately so it stops consuming API quota
+    fetchController?.abort();
     clearTimeout(fetchTimer);
     fetchTimer = setTimeout(fetchRoute, FETCH_DEBOUNCE);
+}
+
+// Fetch one GraphHopper segment and return its geometry as [{lat,lng}].
+// Also updates the credits panel from the response headers.
+async function fetchSegment(wps, profile, signal) {
+    const points = wps.map(w => `${w.lat.toFixed(6)},${w.lng.toFixed(6)}`).join(';');
+    const url    = `${GH_ROUTE_BASE}?profile=${profile}&points=${encodeURIComponent(points)}`;
+    const res    = await fetch(url, { signal });
+    const data   = await res.json();
+
+    const credLimit    = res.headers.get('x-ratelimit-limit');
+    const credRem      = res.headers.get('x-ratelimit-remaining');
+    const credResetSec = res.headers.get('x-ratelimit-reset');
+    const credCost     = res.headers.get('x-ratelimit-credits');
+    if (credLimit && credRem) {
+        ghCredits = {
+            limit:     +credLimit,
+            remaining: +credRem,
+            resetSec:  credResetSec ? +credResetSec : null,
+            lastCost:  credCost     ? +credCost     : null,
+        };
+        updateCreditsPanel();
+    }
+
+    if (!data.paths?.[0]) throw new Error(data.message || 'No route found');
+    return data.paths[0].points.coordinates.map(([lng, lat]) => ({ lat, lng }));
 }
 
 async function fetchRoute() {
@@ -176,64 +209,74 @@ async function fetchRoute() {
         return;
     }
 
-    // Cancel any in-flight request
+    // Cancel any in-flight request and create a local controller for THIS call.
+    // Using a local reference is critical: if a newer fetchRoute call aborts this one,
+    // the finally block below must check OUR controller (already aborted), not the
+    // global fetchController (which now belongs to the newer call and is still active).
     fetchController?.abort();
-    fetchController = new AbortController();
-    fetchingRoute = true;
-    setRouteStatus('loading', 'Calculating route…');
+    const controller = new AbortController();
+    fetchController  = controller;
+    fetchingRoute    = true;
 
-    // GraphHopper expects "lat,lon" per point (unlike OSRM which uses "lon,lat")
-    const points = waypoints.map(w => `${w.lat.toFixed(6)},${w.lng.toFixed(6)}`).join(';');
-    const url    = `${GH_ROUTE_BASE}?profile=${routeProfile}&points=${encodeURIComponent(points)}`;
+    // Split waypoints into overlapping segments of GH_MAX_PTS.
+    // Adjacent segments share one junction point so the joined geometry is continuous.
+    const segments = [];
+    for (let i = 0; i < waypoints.length - 1; i += GH_MAX_PTS - 1) {
+        segments.push(waypoints.slice(i, i + GH_MAX_PTS));
+    }
+    const isSplit = segments.length > 1;
 
     try {
-        const res  = await fetch(url, { signal: fetchController.signal });
-        const data = await res.json();
-
-        // Read GraphHopper rate-limit headers forwarded by the proxy
-        const credLimit    = res.headers.get('x-ratelimit-limit');
-        const credRem      = res.headers.get('x-ratelimit-remaining');
-        const credResetSec = res.headers.get('x-ratelimit-reset');   // seconds until reset
-        const credCost     = res.headers.get('x-ratelimit-credits'); // cost of this request
-        if (credLimit && credRem) {
-            ghCredits = {
-                limit:    +credLimit,
-                remaining: +credRem,
-                resetSec:  credResetSec ? +credResetSec : null,
-                lastCost:  credCost ? +credCost : null,
-            };
-            updateCreditsPanel();
+        let allCoords = [];
+        for (let s = 0; s < segments.length; s++) {
+            setRouteStatus('loading', isSplit
+                ? `Calculating route (segment ${s + 1}/${segments.length})…`
+                : 'Calculating route…');
+            const coords = await fetchSegment(segments[s], routeProfile, controller.signal);
+            // Drop the first point of subsequent segments — it duplicates the junction
+            allCoords = s === 0 ? coords : allCoords.concat(coords.slice(1));
         }
+        routeGeo = allCoords;
 
-        if (data.paths?.[0]) {
-            // GeoJSON coordinates are [lng, lat]
-            routeGeo = data.paths[0].points.coordinates.map(([lng, lat]) => ({ lat, lng }));
-
-            // Fetch real terrain elevation for each point along the road
-            try {
-                setRouteStatus('loading', 'Fetching elevation data…');
-                await enrichWithElevation(fetchController.signal);
-                const alts   = routeGeo.map(p => p.alt).filter(a => a != null);
-                const elvStr = alts.length
-                    ? ` · ${Math.round(Math.min(...alts))}–${Math.round(Math.max(...alts))} m`
-                    : '';
-                setRouteStatus('ok', `Road route · ${fmtDist(totalRouteDistance())}${elvStr}`);
-            } catch (elevErr) {
-                if (elevErr.name === 'AbortError') throw elevErr;
-                // Elevation failed — road geometry is still usable, fall back to input altitude
-                setRouteStatus('ok', `Road route · ${fmtDist(totalRouteDistance())} (no elevation data)`);
-            }
-        } else {
-            routeGeo = [];
-            const msg = data.message || 'No route found';
-            setRouteStatus('warn', `${msg} — using straight line`);
+        // Fetch real terrain elevation for each point along the road
+        try {
+            setRouteStatus('loading', 'Fetching elevation data…');
+            await enrichWithElevation(controller.signal);
+            const alts   = routeGeo.map(p => p.alt).filter(a => a != null);
+            const elvStr = alts.length
+                ? ` · ${Math.round(Math.min(...alts))}–${Math.round(Math.max(...alts))} m`
+                : '';
+            const label = isSplit ? `Road route (${segments.length} segments)` : 'Road route';
+            setRouteStatus('ok', `${label} · ${fmtDist(totalRouteDistance())}${elvStr}`);
+        } catch (elevErr) {
+            if (elevErr.name === 'AbortError') throw elevErr;
+            const label = isSplit ? `Road route (${segments.length} segments)` : 'Road route';
+            setRouteStatus('ok', `${label} · ${fmtDist(totalRouteDistance())} (no elevation data)`);
         }
     } catch (e) {
         if (e.name === 'AbortError') return;   // superseded by a newer fetch
         routeGeo = [];
-        setRouteStatus('warn', 'Routing unavailable — using straight line');
+        if (e.message?.toLowerCase().includes('limit')) {
+            // GH minutely rate limit hit — show countdown and auto-retry
+            let secs = 15;
+            setRouteStatus('warn', `GH rate limit — retrying in ${secs}s…`);
+            clearInterval(retryTimer);
+            retryTimer = setInterval(() => {
+                secs--;
+                if (secs <= 0) {
+                    clearInterval(retryTimer);
+                    retryTimer = null;
+                    scheduleRouteFetch();
+                } else {
+                    setRouteStatus('warn', `GH rate limit — retrying in ${secs}s…`);
+                }
+            }, 1000);
+        } else {
+            setRouteStatus('warn', 'Routing unavailable — using straight line');
+        }
     } finally {
-        if (!fetchController?.signal.aborted) {
+        // Only clean up if this specific call is still the active one (not aborted by a newer call)
+        if (!controller.signal.aborted) {
             fetchingRoute   = false;
             fetchController = null;
             redrawPolyline();
@@ -434,6 +477,8 @@ function redrawPolyline() {
 function clearRoute() {
     stopPlayback();
     clearTimeout(fetchTimer);
+    clearInterval(retryTimer);
+    retryTimer = null;
     fetchController?.abort();
     fetchingRoute = false;
     waypoints.forEach(w => w.marker.remove());
