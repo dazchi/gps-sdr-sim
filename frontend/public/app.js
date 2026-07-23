@@ -826,5 +826,35 @@ routingGroup.addEventListener('click', e => {
     scheduleRouteFetch();
 });
 
+// Auto-locate the user on load (blue dot + accuracy circle, like OSM).
+// Skips silently if geolocation is unavailable or the user denies permission.
+// Does not recenter if the user has already interacted with the map.
+function autoLocateOnLoad() {
+    if (!navigator.geolocation) return;
+
+    let userMoved = false;
+    const markMoved = () => { userMoved = true; };
+    map.once('dragstart zoomstart click', markMoved);
+
+    navigator.geolocation.getCurrentPosition(
+        (pos) => {
+            const { latitude: lat, longitude: lng, accuracy } = pos.coords;
+            const icon = L.divIcon({
+                className: '', html: '<div class="geo-pin"></div>',
+                iconSize: [14, 14], iconAnchor: [7, 7],
+            });
+            L.marker([lat, lng], { icon, interactive: false, keyboard: false }).addTo(map);
+            L.circle([lat, lng], {
+                radius: accuracy, color: '#4a9eff', weight: 1,
+                fillColor: '#4a9eff', fillOpacity: 0.1, interactive: false,
+            }).addTo(map);
+            if (!userMoved) map.setView([lat, lng], 16);
+        },
+        () => { /* permission denied or timeout — stay on the default view */ },
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }
+    );
+}
+
 // Bootstrap
 refreshUI();
+autoLocateOnLoad();
