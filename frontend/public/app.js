@@ -17,6 +17,7 @@ let waypoints    = [];   // { id, lat, lng, alt, marker }
 let nextId       = 0;
 let routeGeo     = [];   // [{ lat, lng }] decoded from OSRM — used for display & interpolation
 let routeLine    = null;
+let trkptLayer   = null;  // L.layerGroup holding CircleMarkers when Show trkpt is on
 let posMarker    = null;   // playback cursor (JS-side)
 let simMarker    = null;   // simulator feedback (C-side processed position)
 let simLastLLH   = null;   // { lat, lon, alt } of last feedback — null when no valid fix
@@ -33,7 +34,9 @@ let retryTimer      = null;  // interval ID for GH rate-limit countdown
 let playing   = false;
 let paused    = false;
 let progress  = 0;        // metres travelled along routeGeo so far
-let direction = 1;        // +1 forward, -1 backward (back & forth mode)
+let direction  = 1;       // +1 forward, -1 backward (bounce mode)
+let repeatMode = 'off';   // 'off' | 'bounce' | 'loop'
+let loopsDone  = 0;       // count of completed loops for finite loop count
 let ticker    = null;
 
 let stopRemainingMs = 0;  // ms left in current random stop
@@ -51,18 +54,26 @@ const btnClear     = el('btn-clear');
 const btnGpx       = el('btn-gpx');
 const inSpeed      = el('input-speed');
 const inAlt        = el('input-alt');
-const inLoop       = el('input-loop');
+const repeatGroup  = el('repeat-group');
+const loopCountRow = el('loop-count-row');
+const inLoopCount  = el('input-loop-count');
 const inJitter     = el('input-jitter');
 const inStopProb   = el('input-stop-prob');
 const inStopMin    = el('input-stop-min');
 const inStopMax    = el('input-stop-max');
+const inStopTrkpt  = el('input-stop-trkpt');
+const inShowTrkpt  = el('input-show-trkpt');
 const modeGroup    = el('mode-group');
 const routingGroup = el('routing-group');
 const routeStatus  = el('route-status');
 const wpCount      = el('wp-count');
 const wpListEl     = el('wp-list');
+const inWpLat      = el('input-wp-lat');
+const inWpLng      = el('input-wp-lng');
+const btnWpAdd     = el('btn-wp-add');
 const infoDist     = el('info-dist');
 const infoTime     = el('info-time');
+const infoTrkpt    = el('info-trkpt');
 const infoProg     = el('info-prog');
 const infoPos      = el('info-pos');
 const infoSimPos   = el('info-sim-pos');
@@ -108,8 +119,12 @@ function totalRouteDistance() {
 
 // The point set used for display, distance and interpolation.
 // Uses the OSRM road geometry when available, falls back to straight-line waypoints.
+// In loop mode, appends the first waypoint at the end so the closing leg is included.
 function activePts() {
-    return routeGeo.length >= 2 ? routeGeo : waypoints.map(w => ({ lat: w.lat, lng: w.lng }));
+    if (routeGeo.length >= 2) return routeGeo;
+    const pts = waypoints.map(w => ({ lat: w.lat, lng: w.lng }));
+    if (repeatMode === 'loop' && pts.length >= 2) pts.push({ ...pts[0] });
+    return pts;
 }
 
 function interpolateAt(dist) {
@@ -218,11 +233,17 @@ async function fetchRoute() {
     fetchController  = controller;
     fetchingRoute    = true;
 
+    // In loop mode, append the first waypoint at the end so the routing engine
+    // returns geometry for the closing leg (last → first).
+    const routeWps = repeatMode === 'loop' && waypoints.length >= 2
+        ? [...waypoints, waypoints[0]]
+        : waypoints;
+
     // Split waypoints into overlapping segments of GH_MAX_PTS.
     // Adjacent segments share one junction point so the joined geometry is continuous.
     const segments = [];
-    for (let i = 0; i < waypoints.length - 1; i += GH_MAX_PTS - 1) {
-        segments.push(waypoints.slice(i, i + GH_MAX_PTS));
+    for (let i = 0; i < routeWps.length - 1; i += GH_MAX_PTS - 1) {
+        segments.push(routeWps.slice(i, i + GH_MAX_PTS));
     }
     const isSplit = segments.length > 1;
 
@@ -465,12 +486,23 @@ function renumberMarkers() {
 }
 
 function redrawPolyline() {
-    if (routeLine) { routeLine.remove(); routeLine = null; }
+    if (routeLine)  { routeLine.remove();  routeLine  = null; }
+    if (trkptLayer) { trkptLayer.remove(); trkptLayer = null; }
+
     const pts = activePts();
     if (pts.length >= 2) {
         routeLine = L.polyline(pts.map(p => [p.lat, p.lng]), {
             color: '#4a9eff', weight: 3, opacity: 0.85,
         }).addTo(map);
+    }
+
+    // Draw a bright yellow dot at each routed trkpt when the toggle is on.
+    // Yellow contrasts sharply with the blue route line so every point stands out.
+    if (inShowTrkpt.checked && routeGeo.length >= 2) {
+        trkptLayer = L.layerGroup(routeGeo.map(p => L.circleMarker([p.lat, p.lng], {
+            radius: 5, weight: 2, color: '#1a1d26', fillColor: '#ffd400',
+            fillOpacity: 1, interactive: false,
+        }))).addTo(map);
     }
 }
 
@@ -484,8 +516,9 @@ function clearRoute() {
     waypoints.forEach(w => w.marker.remove());
     waypoints = [];
     routeGeo  = [];
-    if (routeLine) { routeLine.remove(); routeLine = null; }
-    if (posMarker) { posMarker.remove(); posMarker = null; }
+    if (routeLine)  { routeLine.remove();  routeLine  = null; }
+    if (trkptLayer) { trkptLayer.remove(); trkptLayer = null; }
+    if (posMarker)  { posMarker.remove();  posMarker  = null; }
     setRouteStatus('', '');
     refreshUI();
 }
@@ -517,14 +550,35 @@ function refreshUI() {
         wpListEl.appendChild(row);
     });
 
-    // Route info
+    // Route info — scaled by the total number of traversals for repeat modes:
+    //   loop   : one loop  = one traversal (start→end)      → n × total
+    //   bounce : one loop  = two traversals (start→end→start) → 2n × total
+    const loopN     = parseInt(inLoopCount.value, 10);
+    const finiteN   = Number.isFinite(loopN) && loopN > 0 ? loopN : null;
+    const perLoop   = repeatMode === 'bounce' ? 2 : 1;
+    const scaled    = repeatMode !== 'off' && finiteN != null
+        ? total * perLoop * finiteN : null;
+    const infinite  = repeatMode !== 'off' && finiteN == null;
+
     if (fetchingRoute) {
         infoDist.textContent = '…';
         infoTime.textContent = '…';
+    } else if (n < 2) {
+        infoDist.textContent = '—';
+        infoTime.textContent = '—';
+    } else if (infinite) {
+        infoDist.textContent = '∞';
+        infoTime.textContent = '∞';
+    } else if (scaled != null) {
+        infoDist.textContent = `${fmtDist(scaled)} (${finiteN}×)`;
+        infoTime.textContent = spd > 0 ? fmtTime(scaled / spd) : '—';
     } else {
-        infoDist.textContent = n >= 2 ? fmtDist(total) : '—';
-        infoTime.textContent = n >= 2 && spd > 0 ? fmtTime(total / spd) : '—';
+        infoDist.textContent = fmtDist(total);
+        infoTime.textContent = spd > 0 ? fmtTime(total / spd) : '—';
     }
+
+    // Track-point count from the routed geometry — only meaningful in route mode
+    infoTrkpt.textContent = routeGeo.length >= 2 ? String(routeGeo.length) : '—';
 
     if ((playing || paused) && total > 0) {
         infoProg.textContent = `${Math.min(progress / total * 100, 100).toFixed(1)}%`;
@@ -656,11 +710,20 @@ function showError(message) {
 
 // ── Playback ──────────────────────────────────────────────────
 function computeStopCheckpoints() {
-    // Find distance-along-route for each intermediate user waypoint (not first, not last).
-    // These are the points where random stops can be triggered, matching the Python script behaviour.
+    // Distances-along-route where random stops can trigger.
+    //   Default   : intermediate user waypoints only (matches the Python script).
+    //   Trkpt on  : every point in the routeGeo (route mode only) — lets stops happen
+    //               anywhere along the road, not only at named waypoints.
+    if (waypoints.length < 2) return [];
+    const cumDist = segmentDistances(activePts());
+
+    // Trkpt mode: every route point is a candidate stop, skipping the very first
+    // and last so we don't stall at start/end.
+    if (inStopTrkpt.checked && routeGeo.length >= 2) {
+        return cumDist.slice(1, -1).map(d => ({ dist: d }));
+    }
+
     if (waypoints.length <= 2) return [];
-    const pts     = activePts();
-    const cumDist = segmentDistances(pts);
 
     if (routeGeo.length >= 2) {
         // Project each intermediate waypoint onto the nearest routeGeo point
@@ -684,6 +747,7 @@ function startPlayback() {
     paused  = false;
     stopRemainingMs = 0;
     stopCheckpoints = computeStopCheckpoints();
+    loopsDone = 0;
 
     if (!posMarker) {
         const p = interpolateAt(progress);
@@ -709,6 +773,7 @@ function stopPlayback() {
     progress        = 0;
     direction       = 1;
     stopRemainingMs = 0;
+    loopsDone       = 0;
     clearInterval(ticker);
     if (posMarker) { posMarker.remove(); posMarker = null; }
     refreshUI();
@@ -740,11 +805,42 @@ function tickPlayback() {
     const prevProgress = progress;
     progress += effectiveSpd * direction * (TICK_MS / 1000);
 
+    // Random-stop parameters — computed once, used at both endpoints and intermediates
+    const stopProb  = Math.max(0, Math.min(1, parseFloat(inStopProb.value) || 0));
+    const stopMinMs = (parseFloat(inStopMin.value) || 0) * 1000;
+    const stopMaxMs = Math.max(stopMinMs, (parseFloat(inStopMax.value) || 0) * 1000);
+    const rollStop  = () => stopProb > 0 && Math.random() < stopProb
+        ? stopMinMs + Math.random() * (stopMaxMs - stopMinMs) : 0;
+
     // ── Endpoint handling ─────────────────────────────────
+    // A "loop" is one full return to the starting position:
+    //   loop mode  : reaching the end and resetting to 0
+    //   bounce mode: reaching the end then returning to 0 (out AND back)
+    // In bounce/loop modes, endpoints (start on return, end always) are also
+    // valid random-stop candidates. The initial launch at progress=0 is naturally
+    // skipped because we only enter the progress<=0 branch after bouncing back.
+    const loopLimit = parseInt(inLoopCount.value, 10);
+    const hasLimit  = Number.isFinite(loopLimit) && loopLimit > 0;
+
     if (progress >= total) {
         progress = total;
-        if (inLoop.checked) {
+        if (repeatMode === 'loop') {
+            loopsDone++;
+            if (hasLimit && loopsDone >= loopLimit) {
+                sendPosition(waypoints[0].lat, waypoints[0].lng, waypoints[0].alt);
+                posMarker?.setLatLng([waypoints[0].lat, waypoints[0].lng]);
+                stopPlayback();
+                return;
+            }
+            // Optional pause at end/start (same physical spot) before restarting the loop
+            const ms = rollStop();
+            if (ms > 0) { stopRemainingMs = ms; /* hold at progress=total this tick */ }
+            else        { progress = 0; }
+        } else if (repeatMode === 'bounce') {
             direction = -1;
+            // Optional pause at the end waypoint before reversing
+            const ms = rollStop();
+            if (ms > 0) stopRemainingMs = ms;
         } else {
             const last = waypoints.at(-1);
             sendPosition(last.lat, last.lng, last.alt);
@@ -753,15 +849,24 @@ function tickPlayback() {
             return;
         }
     } else if (progress <= 0) {
-        progress  = 0;
+        progress = 0;
+        if (repeatMode === 'bounce' && direction === -1) {
+            loopsDone++;
+            if (hasLimit && loopsDone >= loopLimit) {
+                sendPosition(waypoints[0].lat, waypoints[0].lng, waypoints[0].alt);
+                posMarker?.setLatLng([waypoints[0].lat, waypoints[0].lng]);
+                stopPlayback();
+                return;
+            }
+            // Optional pause at the start waypoint before heading out again
+            const ms = rollStop();
+            if (ms > 0) stopRemainingMs = ms;
+        }
         direction = 1;
     }
 
     // ── Random stop at intermediate waypoints ─────────────
-    const stopProb = Math.max(0, Math.min(1, parseFloat(inStopProb.value) || 0));
-    if (stopProb > 0 && stopCheckpoints.length > 0) {
-        const stopMinMs = (parseFloat(inStopMin.value) || 0) * 1000;
-        const stopMaxMs = Math.max(stopMinMs, (parseFloat(inStopMax.value) || 0) * 1000);
+    if (stopRemainingMs === 0 && stopProb > 0 && stopCheckpoints.length > 0) {
         for (const cp of stopCheckpoints) {
             const crossed = (prevProgress < cp.dist && progress >= cp.dist) ||
                             (prevProgress > cp.dist && progress <= cp.dist);
@@ -788,7 +893,45 @@ btnPause.addEventListener(  'click',  pausePlayback);
 btnStop.addEventListener(   'click',  stopPlayback);
 btnClear.addEventListener(  'click',  clearRoute);
 btnGpx.addEventListener(    'click',  downloadGPX);
+
+// Manual waypoint entry: add a waypoint at the typed lat/lon, pan the map,
+// and clear the inputs so the next entry starts fresh.
+function submitManualWaypoint() {
+    const lat = parseFloat(inWpLat.value);
+    const lng = parseFloat(inWpLng.value);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)
+        || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+        inWpLat.focus();
+        return;
+    }
+    addWaypoint(lat, lng);
+    map.panTo([lat, lng]);
+    inWpLat.value = '';
+    inWpLng.value = '';
+    inWpLat.focus();
+}
+btnWpAdd.addEventListener('click', submitManualWaypoint);
+[inWpLat, inWpLng].forEach(inp => {
+    inp.addEventListener('keydown', e => {
+        if (e.key === 'Enter') submitManualWaypoint();
+    });
+    // Auto-split Google-Maps-style "lat, lng" paste into both fields
+    inp.addEventListener('paste', e => {
+        const text = e.clipboardData?.getData('text')?.trim();
+        const m = text?.match(/^(-?\d+(?:\.\d+)?)\s*[,\s]\s*(-?\d+(?:\.\d+)?)$/);
+        if (!m) return;
+        e.preventDefault();
+        inWpLat.value = m[1];
+        inWpLng.value = m[2];
+        inWpLng.focus();
+    });
+});
 inSpeed.addEventListener(   'input',  refreshUI);
+inStopTrkpt.addEventListener('change', () => {
+    // Live toggle during playback: recompute the checkpoint list immediately
+    if (playing || paused) stopCheckpoints = computeStopCheckpoints();
+});
+inShowTrkpt.addEventListener('change', redrawPolyline);
 infoSimPos.addEventListener('click', () => {
     if (simLastLLH) map.panTo([simLastLLH.lat, simLastLLH.lon]);
 });
@@ -805,6 +948,26 @@ modeGroup.addEventListener('click', e => {
         scheduleRouteFetch();
     }
 });
+
+repeatGroup.addEventListener('click', e => {
+    const btn = e.target.closest('.mode-btn');
+    if (!btn) return;
+    repeatGroup.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const prev  = repeatMode;
+    repeatMode  = btn.dataset.repeat;
+    loopCountRow.style.display = repeatMode === 'off' ? 'none' : '';
+    // Loop mode requires a closing leg in the routing geometry — refetch when toggling to/from loop
+    if (routingMode === 'route' && (prev === 'loop') !== (repeatMode === 'loop') && waypoints.length >= 2) {
+        routeGeo = [];
+        scheduleRouteFetch();
+    } else {
+        redrawPolyline();
+        refreshUI();
+    }
+});
+
+inLoopCount.addEventListener('input', refreshUI);
 
 routingGroup.addEventListener('click', e => {
     const btn = e.target.closest('.mode-btn');

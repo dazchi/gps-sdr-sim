@@ -228,9 +228,14 @@ A browser-based route planner that streams GPS positions to a running `gps-sdr-s
 
 **Features:**
 - Interactive Leaflet map — click to add waypoints, right-click to teleport the sim position
-- Route planning via [GraphHopper](https://www.graphhopper.com/) (foot / bike / car profiles) or raw waypoint interpolation
+- Manual waypoint entry with paste support for Google-Maps-style `lat, lng` strings
+- Auto-locate on page load (OSM-style blue-dot marker with accuracy circle)
+- Route planning via [GraphHopper](https://www.graphhopper.com/) (foot / bike / car profiles) or raw waypoint interpolation; long routes are split across multiple requests to respect the per-request waypoint limit
 - Walk / Bike / Drive speed presets (5 / 10 / 40 km/h)
-- Speed jitter and random waypoint stops for realistic motion
+- Repeat modes: **Off** (stop at end), **Bounce** (back-and-forth), or **Loop** (route last back to first), each with a configurable loop count (blank = infinite)
+- Speed jitter and random stops — at waypoints only, at every route track point (optional), and at start/end for Bounce/Loop modes
+- Toggle to render every route track point as a bright yellow dot on the map
+- Track-point count and estimated total distance × loop count shown in the info panel
 - Sim LLH feedback: displays the last position processed by gps-sdr-sim; click to pan the map
 - GPX export of the planned route
 - SRTM elevation lookup via [OpenTopoData](https://www.opentopodata.org/)

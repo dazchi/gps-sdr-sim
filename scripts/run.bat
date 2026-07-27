@@ -51,7 +51,7 @@ timeout /t 2 /nobreak >nul
 :: Launch gps-sdr-sim
 :: Flags: -H direct HackRF transmit, -b 8 signed 8-bit I/Q, -S TCP socket input port 6000
 echo [*] Starting gps-sdr-sim ...
-start "gps-sdr-sim" cmd /k "%SIMEXE% -e %NAVFILE% -b 8 -s 4000000 -p 128 -H -S"
+start "gps-sdr-sim" cmd /k "%SIMEXE% -e %NAVFILE% -b 8 -s 4000000 -p 128 -T now -H -S "
 
 echo.
 echo [+] Both processes launched in separate windows.

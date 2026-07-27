@@ -75,8 +75,19 @@
       </div>
 
       <div class="field-row">
-        <label>Back &amp; forth</label>
-        <input type="checkbox" id="input-loop">
+        <label>Repeat</label>
+        <div class="mode-group" id="repeat-group">
+          <button class="mode-btn active" data-repeat="off"    title="Stop at last waypoint">↦ Off</button>
+          <button class="mode-btn"        data-repeat="bounce" title="Back and forth">⇄ Bounce</button>
+          <button class="mode-btn"        data-repeat="loop"   title="Route last back to first, then loop">↻ Loop</button>
+        </div>
+      </div>
+
+      <div class="field-row" id="loop-count-row" style="display:none">
+        <label>Loops <span class="label-hint">(blank = ∞)</span></label>
+        <div class="input-unit">
+          <input type="number" id="input-loop-count" placeholder="∞" min="1" step="1">
+        </div>
       </div>
 
       <div class="play-row">
@@ -115,6 +126,11 @@
           <span>s</span>
         </div>
       </div>
+
+      <div class="field-row">
+        <label>Stop at trkpt <span class="label-hint">(route only)</span></label>
+        <input type="checkbox" id="input-stop-trkpt">
+      </div>
     </div>
 
     <!-- Route info -->
@@ -123,11 +139,16 @@
       <div class="info-grid">
         <span class="info-key">Distance</span>   <span id="info-dist">—</span>
         <span class="info-key">Est. time</span>  <span id="info-time">—</span>
+        <span class="info-key">Trkpt</span>      <span id="info-trkpt">—</span>
         <span class="info-key">Progress</span>   <span id="info-prog">—</span>
         <span class="info-key">Position</span>   <span id="info-pos">—</span>
         <span class="info-key">Sim LLH</span>    <span id="info-sim-pos" class="info-sim-pos">—</span>
       </div>
-      <div class="play-row mt-8">
+      <div class="field-row mt-8">
+        <label>Show trkpt</label>
+        <input type="checkbox" id="input-show-trkpt">
+      </div>
+      <div class="play-row">
         <button id="btn-gpx"   class="btn btn-secondary flex-1" disabled>⬇ GPX</button>
         <button id="btn-clear" class="btn btn-secondary flex-1">Clear Route</button>
       </div>
@@ -140,6 +161,11 @@
         <span id="wp-count" class="badge">0</span>
       </div>
       <div class="panel-hint">Left-click map to add &nbsp;·&nbsp; Right-click map to set sim position</div>
+      <div class="wp-add-row">
+        <input type="number" id="input-wp-lat" placeholder="lat"  step="0.000001" min="-90"  max="90">
+        <input type="number" id="input-wp-lng" placeholder="lon"  step="0.000001" min="-180" max="180">
+        <button id="btn-wp-add" class="btn btn-secondary" title="Add waypoint">+</button>
+      </div>
       <div id="wp-list"></div>
     </div>
   </aside>
