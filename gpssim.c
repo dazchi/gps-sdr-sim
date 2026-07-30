@@ -11,6 +11,7 @@
 #include "getopt.h"
 #else
 #include <unistd.h>
+#include <sched.h>   // SCHED_FIFO for real-time thread priority
 #endif
 #include "gpssim.h"
 #include "hackrf.h"
@@ -166,13 +167,18 @@ void rb_write(int8_t* data, size_t len) {
 	pthread_mutex_unlock(&rb_mutex);
 }
 
+// Cumulative underrun stats — logged from the main loop, not the callback,
+// so we never call fprintf under the ring-buffer mutex.
+static volatile size_t underrun_count       = 0;
+static volatile size_t underrun_bytes_total = 0;
+
 // HackRF asynchronous callback
 int hackrf_tx_callback(hackrf_transfer* transfer) {
 	pthread_mutex_lock(&rb_mutex);
 	size_t len = transfer->valid_length;
 
 	if (rb_count >= len) {
-		// Buffer has enough data
+		// Buffer has enough data — normal path
 		size_t part1 = RB_SIZE - rb_tail;
 		if (len <= part1) {
 			memcpy(transfer->buffer, ring_buffer + rb_tail, len);
@@ -185,8 +191,43 @@ int hackrf_tx_callback(hackrf_transfer* transfer) {
 		rb_count -= len;
 	}
 	else {
-		// Buffer underrun: zero-fill to avoid transmitting garbage
-		memset(transfer->buffer, 0, len);
+		// Buffer underrun. Instead of zero-filling (which mutes the carrier and
+		// forces the receiver to reacquire), replay the most recently-transmitted
+		// bytes. The bytes just BEFORE rb_tail are still in ring_buffer memory
+		// (we advance the tail index on read but never clear the storage).
+		// This gives the receiver a continuous carrier and a small code-phase
+		// step-back rather than a hard signal outage.
+		size_t missing = len - rb_count;
+
+		// First, drain whatever valid data is still in the buffer (may be 0)
+		size_t drained = rb_count;
+		if (drained > 0) {
+			size_t part1 = RB_SIZE - rb_tail;
+			if (drained <= part1) {
+				memcpy(transfer->buffer, ring_buffer + rb_tail, drained);
+			}
+			else {
+				memcpy(transfer->buffer, ring_buffer + rb_tail, part1);
+				memcpy(transfer->buffer + part1, ring_buffer, drained - part1);
+			}
+			rb_tail = (rb_tail + drained) % RB_SIZE;
+			rb_count = 0;
+		}
+
+		// Replay the last `missing` bytes from before rb_tail. Compute the
+		// replay start as (rb_tail - missing) modulo RB_SIZE.
+		size_t replay_start = (rb_tail + RB_SIZE - (missing % RB_SIZE)) % RB_SIZE;
+		size_t part1 = RB_SIZE - replay_start;
+		if (missing <= part1) {
+			memcpy(transfer->buffer + drained, ring_buffer + replay_start, missing);
+		}
+		else {
+			memcpy(transfer->buffer + drained, ring_buffer + replay_start, part1);
+			memcpy(transfer->buffer + drained + part1, ring_buffer, missing - part1);
+		}
+
+		underrun_count++;
+		underrun_bytes_total += missing;
 	}
 
 	pthread_cond_signal(&rb_cond); // Wake up the generator loop
@@ -2590,6 +2631,26 @@ int main(int argc, char *argv[])
 		}
 
 		fprintf(stderr, "HackRF TX Started at 1575.42 MHz...\n");
+
+		// Boost the sample-generation thread to real-time priority so an OS
+		// scheduling stall does not starve the HackRF ring buffer. Without this,
+		// a brief CPU spike elsewhere on the machine (browser, indexer, GC pause)
+		// drains the ring buffer and forces the receiver to reacquire.
+#ifdef _WIN32
+		if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL))
+			fprintf(stderr, "WARN: SetThreadPriority(TIME_CRITICAL) failed (err %lu). Underruns more likely.\n",
+				GetLastError());
+		else
+			fprintf(stderr, "Generator thread priority: TIME_CRITICAL.\n");
+#else
+		{
+			struct sched_param sp; sp.sched_priority = 50;
+			if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
+				fprintf(stderr, "WARN: SCHED_FIFO not granted (need sudo or CAP_SYS_NICE). Underruns more likely.\n");
+			else
+				fprintf(stderr, "Generator thread policy: SCHED_FIFO prio 50.\n");
+		}
+#endif
 	}
 
 	////////////////////////////////////////////////////////////
@@ -2601,8 +2662,22 @@ int main(int argc, char *argv[])
 	// Update receiver time
 	grx = incGpsTime(grx, 0.1);
 
+	// Track last-reported underrun count so we log each new event exactly once
+	// from the main loop (never from the audio callback, which must stay lock-free
+	// and syscall-free). Prints wall-clock elapsed seconds alongside the total.
+	size_t last_reported_underruns = 0;
+
 	for (iumd = 1; (socket_mode || iumd < numd) && is_running; iumd++)
 	{
+		// Report ring-buffer underruns as they happen (once per event, main-thread stderr).
+		if (hackrf_mode && underrun_count > last_reported_underruns) {
+			size_t new_events = underrun_count - last_reported_underruns;
+			double elapsed    = (double)(clock() - tstart) / CLOCKS_PER_SEC;
+			fprintf(stderr, "[UNDERRUN] +%zu event(s) @ t=%.1fs — total=%zu, bytes=%zu (replayed)\n",
+				new_events, elapsed, (size_t)underrun_count, (size_t)underrun_bytes_total);
+			last_reported_underruns = underrun_count;
+		}
+
 		// In socket mode, consume next position from the FIFO if available;
 		// otherwise keep transmitting from the last known position.
 		if (socket_mode) {
