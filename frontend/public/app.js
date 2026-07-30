@@ -52,6 +52,8 @@ const btnPause     = el('btn-pause');
 const btnStop      = el('btn-stop');
 const btnClear     = el('btn-clear');
 const btnGpx       = el('btn-gpx');
+const btnGpxLoad   = el('btn-gpx-load');
+const gpxFileInput = el('gpx-file-input');
 const inSpeed      = el('input-speed');
 const inAlt        = el('input-alt');
 const repeatGroup  = el('repeat-group');
@@ -367,6 +369,72 @@ function updateCreditsPanel() {
 }
 
 // ── GPX export ───────────────────────────────────────────────
+// Parse a GPX file and replace the current waypoints with the points it defines.
+// Prefers <wpt> elements (discrete named waypoints). If none exist, falls back
+// to <trkpt> from the first <trkseg>. Loading many trkpts as waypoints is
+// possible but will burn GraphHopper credits — confirm with the user first.
+async function loadGPX(file) {
+    let text;
+    try { text = await file.text(); }
+    catch (e) { setRouteStatus('error', `Cannot read file: ${e.message}`); return; }
+
+    const doc = new DOMParser().parseFromString(text, 'application/xml');
+    if (doc.querySelector('parsererror')) {
+        setRouteStatus('error', 'Invalid GPX file (XML parse error)');
+        return;
+    }
+
+    const readPts = (nodeList) => Array.from(nodeList).map(n => {
+        const lat = parseFloat(n.getAttribute('lat'));
+        const lon = parseFloat(n.getAttribute('lon'));
+        const eleN = n.querySelector('ele');
+        const alt  = eleN ? parseFloat(eleN.textContent) : null;
+        return { lat, lng: lon, alt };
+    }).filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lng));
+
+    let pts = readPts(doc.querySelectorAll('wpt'));
+    let source = 'wpt';
+    if (pts.length === 0) {
+        pts = readPts(doc.querySelectorAll('trkpt'));
+        source = 'trkpt';
+    }
+    if (pts.length < 2) {
+        setRouteStatus('error', 'GPX contains no usable points');
+        return;
+    }
+
+    // Warn before turning a dense trkpt list into individual GH waypoints
+    if (source === 'trkpt' && pts.length > 25 && routingMode === 'route') {
+        const ok = confirm(
+            `This GPX has ${pts.length} track points and no waypoints. ` +
+            `Loading each as a routed waypoint will use ${Math.ceil((pts.length - 1) / 4)} ` +
+            `GraphHopper requests. Continue?`
+        );
+        if (!ok) return;
+    }
+
+    // Clear existing state without touching route status (we'll set it below)
+    stopPlayback();
+    clearTimeout(fetchTimer);
+    clearInterval(retryTimer);
+    retryTimer = null;
+    fetchController?.abort();
+    fetchingRoute = false;
+    waypoints.forEach(w => w.marker.remove());
+    waypoints = [];
+    routeGeo  = [];
+    if (routeLine)  { routeLine.remove();  routeLine  = null; }
+    if (trkptLayer) { trkptLayer.remove(); trkptLayer = null; }
+    if (posMarker)  { posMarker.remove();  posMarker  = null; }
+
+    // Bulk-add without triggering N debounced fetches — one at the end
+    for (const p of pts) addWaypoint(p.lat, p.lng, p.alt ?? defaultAlt());
+
+    // Fit the map to the loaded set
+    map.fitBounds(pts.map(p => [p.lat, p.lng]), { padding: [40, 40] });
+    setRouteStatus('ok', `Loaded ${pts.length} ${source} from ${file.name}`);
+}
+
 function downloadGPX() {
     const pts = activePts();
     if (pts.length < 2) return;
@@ -893,6 +961,11 @@ btnPause.addEventListener(  'click',  pausePlayback);
 btnStop.addEventListener(   'click',  stopPlayback);
 btnClear.addEventListener(  'click',  clearRoute);
 btnGpx.addEventListener(    'click',  downloadGPX);
+btnGpxLoad.addEventListener('click', () => { gpxFileInput.value = ''; gpxFileInput.click(); });
+gpxFileInput.addEventListener('change', e => {
+    const f = e.target.files?.[0];
+    if (f) loadGPX(f);
+});
 
 // Manual waypoint entry: add a waypoint at the typed lat/lon, pan the map,
 // and clear the inputs so the next entry starts fresh.

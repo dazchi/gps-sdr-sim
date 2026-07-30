@@ -149,9 +149,13 @@
         <input type="checkbox" id="input-show-trkpt">
       </div>
       <div class="play-row">
-        <button id="btn-gpx"   class="btn btn-secondary flex-1" disabled>⬇ GPX</button>
-        <button id="btn-clear" class="btn btn-secondary flex-1">Clear Route</button>
+        <button id="btn-gpx-load" class="btn btn-secondary flex-1">⬆ Load GPX</button>
+        <button id="btn-gpx"      class="btn btn-secondary flex-1" disabled>⬇ Save GPX</button>
       </div>
+      <div class="play-row">
+        <button id="btn-clear"    class="btn btn-secondary flex-1">Clear Route</button>
+      </div>
+      <input type="file" id="gpx-file-input" accept=".gpx,application/gpx+xml" style="display:none">
     </div>
 
     <!-- Waypoint list -->
