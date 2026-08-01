@@ -28,6 +28,7 @@ typedef SOCKET sock_t;
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 typedef int sock_t;
 #define SOCK_INVALID (-1)
@@ -1947,16 +1948,22 @@ static void* socket_listener_thread(void* arg)
 				has_last = 1;
 
 				pthread_mutex_lock(&pos_mutex);
-				if (pos_f_count < POS_FIFO_SIZE) {
-					pos_fifo[pos_f_head][0] = lat_r;
-					pos_fifo[pos_f_head][1] = lon_r;
-					pos_fifo[pos_f_head][2] = hgt;
-					pos_f_head = (pos_f_head + 1) % POS_FIFO_SIZE;
-					pos_f_count++;
-					pthread_cond_signal(&pos_cond);
-				} else {
-					fprintf(stderr, "WARNING: Position FIFO full, discarding position.\n");
+				// Latest-wins: on overflow, drop the oldest so the consumer catches
+				// up to real time instead of replaying a stale backlog.
+				if (pos_f_count == POS_FIFO_SIZE) {
+					pos_f_tail = (pos_f_tail + 1) % POS_FIFO_SIZE;
+					pos_f_count--;
+					static size_t drop_count = 0;
+					if (++drop_count % 100 == 1)
+						fprintf(stderr, "NOTE: Position FIFO overflow — dropped %zu stale position(s) so far.\n",
+							drop_count);
 				}
+				pos_fifo[pos_f_head][0] = lat_r;
+				pos_fifo[pos_f_head][1] = lon_r;
+				pos_fifo[pos_f_head][2] = hgt;
+				pos_f_head = (pos_f_head + 1) % POS_FIFO_SIZE;
+				pos_f_count++;
+				pthread_cond_signal(&pos_cond);
 				pthread_mutex_unlock(&pos_mutex);
 
 			} else if (buflen < (int)sizeof(buf) - 1) {

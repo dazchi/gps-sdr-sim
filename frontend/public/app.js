@@ -37,7 +37,12 @@ let progress  = 0;        // metres travelled along routeGeo so far
 let direction  = 1;       // +1 forward, -1 backward (bounce mode)
 let repeatMode = 'off';   // 'off' | 'bounce' | 'loop'
 let loopsDone  = 0;       // count of completed loops for finite loop count
-let ticker    = null;
+// Playback ticker lives in a Web Worker so it is not throttled to ~1 Hz when
+// the tab is backgrounded (main-thread setInterval is).
+const tickWorker = new Worker('tick-worker.js');
+tickWorker.onmessage = (e) => { if (e.data?.type === 'tick') tickPlayback(); };
+const startTicker = () => tickWorker.postMessage({ type: 'start', intervalMs: TICK_MS });
+const stopTicker  = () => tickWorker.postMessage({ type: 'stop' });
 
 let stopRemainingMs = 0;  // ms left in current random stop
 let stopCheckpoints = [];  // { dist } for each intermediate waypoint along route
@@ -822,8 +827,7 @@ function startPlayback() {
         if (p) posMarker = L.marker([p.lat, p.lng], { icon: posIcon, zIndexOffset: 1000 }).addTo(map);
     }
 
-    clearInterval(ticker);
-    ticker = setInterval(tickPlayback, TICK_MS);
+    startTicker();
     refreshUI();
 }
 
@@ -831,7 +835,7 @@ function pausePlayback() {
     if (!playing) return;
     playing = false;
     paused  = true;
-    clearInterval(ticker);
+    stopTicker();
     refreshUI();
 }
 
@@ -842,7 +846,7 @@ function stopPlayback() {
     direction       = 1;
     stopRemainingMs = 0;
     loopsDone       = 0;
-    clearInterval(ticker);
+    stopTicker();
     if (posMarker) { posMarker.remove(); posMarker = null; }
     refreshUI();
 }

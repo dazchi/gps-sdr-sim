@@ -84,7 +84,7 @@
 #define SOCKET_RB_CHUNKS 10       // chunks buffered ahead in socket mode (~1 s latency)
 
 #define SOCKET_PORT    6000   // TCP port for live LLH position input
-#define POS_FIFO_SIZE  256    // Depth of the position FIFO
+#define POS_FIFO_SIZE  4      // Small buffer for jitter; latest-wins on overflow
 #define MAX_POS_JUMP_M 1000.0 // Maximum allowed jump between consecutive positions (metres)
 
 /*! \brief Structure representing GPS time */

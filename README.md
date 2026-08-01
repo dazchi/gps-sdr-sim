@@ -12,10 +12,33 @@ to RF using software-defined radio (SDR) platforms, such as
 4. Select "Release" in Solution Configurations drop-down list.
 5. Build the solution.
 
-### Building with GCC
+### Building on Linux and macOS
+
+The `-H` HackRF transmit mode links libhackrf source (`hackrf.c`) directly and
+requires `libusb-1.0` at build/link time.
+
+- **Linux:** `sudo apt install libusb-1.0-0-dev` (Debian/Ubuntu) or the equivalent for your distro.
+- **macOS:** `brew install libusb`. The Makefile auto-detects the Homebrew prefix.
+
+Then:
 
 ```
-$ gcc gpssim.c -lm -O3 -o gps-sdr-sim
+$ make
+```
+
+Or directly with GCC:
+
+```
+$ gcc gpssim.c hackrf.c -lm -lpthread -lusb-1.0 -O3 -o gps-sdr-sim
+```
+
+On macOS you'll additionally need to point at the Homebrew libusb headers/libs:
+
+```
+$ gcc gpssim.c hackrf.c \
+      -I$(brew --prefix libusb)/include/libusb-1.0 \
+      -L$(brew --prefix libusb)/lib \
+      -lm -lpthread -lusb-1.0 -O3 -o gps-sdr-sim
 ```
 
 ### Using bigger user motion files
@@ -28,11 +51,7 @@ this using make so gps-sdr-bin can update the size when needed. e.g:
 $ make USER_MOTION_SIZE=4000
 ```
 
-This variable can also be set when compiling directly with GCC:
-
-```
-$ gcc gpssim.c -lm -O3 -o gps-sdr-sim -DUSER_MOTION_SIZE=4000
-```
+This variable can also be set when compiling directly with GCC by appending `-DUSER_MOTION_SIZE=4000`.
 
 ### Generating the GPS signal file
 
