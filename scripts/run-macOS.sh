@@ -9,7 +9,7 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 FRONTEND="$ROOT/frontend"
 SIMEXE="$ROOT/gps-sdr-sim"
-NAVFILE="$ROOT/scripts/brdc2120.26n"
+NAVFILE="$ROOT/scripts/brdc2010.26n"
 
 # Optional: capture fresh ephemeris before starting.
 # Requires pyrtcm (pip install pyrtcm) or use the venv at scripts/.venv

@@ -238,12 +238,28 @@ int hackrf_tx_callback(hackrf_transfer* transfer) {
 }
 
 void sigint_handler(int signum) {
+	// Second (or later) Ctrl+C: user has waited and it still hasn't shut down —
+	// bail out immediately rather than pretending to be responsive.
+	static int ctrlc_count = 0;
+	if (++ctrlc_count >= 2) {
+		fprintf(stderr, "\nSecond Ctrl+C — force exiting.\n");
+		_exit(130);
+	}
+
 	fprintf(stderr, "\nCaught Ctrl+C, shutting down gracefully...\n");
 	is_running = 0;
 
+	// Wake the sample-generator if it is blocked on the ring buffer being full.
 	pthread_mutex_lock(&rb_mutex);
 	pthread_cond_broadcast(&rb_cond);
 	pthread_mutex_unlock(&rb_mutex);
+
+	// Wake the main thread if it is blocked on the initial-position wait
+	// (pthread_cond_wait on pos_cond before HackRF TX starts). Without this
+	// broadcast the process ignores Ctrl+C until a position finally arrives.
+	pthread_mutex_lock(&pos_mutex);
+	pthread_cond_broadcast(&pos_cond);
+	pthread_mutex_unlock(&pos_mutex);
 }
 
 /*! \brief Subtract two vectors of double

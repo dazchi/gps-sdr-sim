@@ -11,14 +11,23 @@ CFLAGS+=-DUSER_MOTION_SIZE=$(USER_MOTION_SIZE)
 endif
 LDFLAGS=-lm -lpthread -lusb-1.0
 
-# On macOS, libusb is typically installed via Homebrew and lives outside
-# the default include/lib search paths. Auto-detect it via `brew --prefix`.
+# libusb-1.0 header lives in a subdirectory on most systems, so its include
+# path must be added explicitly. Prefer pkg-config when available (Linux,
+# including Raspberry Pi OS: after `apt install libusb-1.0-0-dev`).
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 LIBUSB_PREFIX := $(shell brew --prefix libusb 2>/dev/null)
 ifneq ($(LIBUSB_PREFIX),)
 CFLAGS  += -I$(LIBUSB_PREFIX)/include/libusb-1.0
 LDFLAGS := -L$(LIBUSB_PREFIX)/lib $(LDFLAGS)
+endif
+else
+LIBUSB_CFLAGS := $(shell pkg-config --cflags libusb-1.0 2>/dev/null)
+ifneq ($(LIBUSB_CFLAGS),)
+CFLAGS += $(LIBUSB_CFLAGS)
+else
+# Fallback: hard-code the standard Debian/Ubuntu location
+CFLAGS += -I/usr/include/libusb-1.0
 endif
 endif
 
